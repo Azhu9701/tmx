@@ -133,6 +133,13 @@ function parseTarget(raw: string) {
 
 // ── Cmux Helpers ─────────────────────────────────────────────────────────────
 
+// Parse cmux pane/surface ref from list output
+// Format: "* pane:29  [1 surface]  [focused]" or "  surface:35"
+function parsePaneRef(line: string): string | null {
+  const m = line.match(/(pane:\d+|surface:\d+)/);
+  return m ? m[1] : null;
+}
+
 // Parse cmux workspace ref from list-workspaces output line
 // Format: "* workspace:10  ✳ name  [selected]" or "  workspace:11  name"
 function parseWorkspaceRef(line: string): string | null {
@@ -142,10 +149,7 @@ function parseWorkspaceRef(line: string): string | null {
 
 function cmuxWorkspaceArg(target: string): string[] {
   const { name } = parseTarget(target);
-
-  // If target is already a workspace:N ref, use directly
   if (/^workspace:\d+$/.test(name)) return ["--workspace", name];
-
   const r = cmux(["list-workspaces"]);
   if (r.exitCode === 0) {
     for (const line of r.stdout.split("\n")) {
@@ -155,7 +159,6 @@ function cmuxWorkspaceArg(target: string): string[] {
       }
     }
   }
-  // Last resort: try the name directly
   return ["--workspace", name];
 }
 
@@ -372,9 +375,11 @@ async function cmdSend(a: Args) {
   if (cmd.length === 0) die("Missing command to send");
 
   if (isCmux) {
-    const args = ["send", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), cmd.join(" ")];
-    const r = cmux(args);
+    const sendArgs = ["send", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), cmd.join(" ")];
+    const r = cmux(sendArgs);
     if (r.exitCode !== 0) die(r.stderr || "Send failed");
+    // cmux send doesn't append Enter, send the Enter key explicitly
+    cmux(["send-key", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), "Enter"]);
     json({ ok: true, backend: "cmux", target, sent: cmd.join(" ") });
   } else {
     const r = tmux(["send-keys", "-t", target, ...cmd, "Enter"]);
@@ -491,15 +496,25 @@ async function cmdBroadcast(a: Args) {
     const panesR = cmux(["list-panes", "--workspace", wid]);
     if (panesR.exitCode !== 0) die("No panes found for: " + target);
 
+    // Get all surfaces in workspace
     const surfaces: string[] = [];
     for (const line of panesR.stdout.split("\n").filter(Boolean)) {
-      const parts = line.split("\t");
-      if (parts[0]) surfaces.push(parts[0]);
+      const pref = parsePaneRef(line);
+      if (!pref) continue;
+      // Get surface for this pane
+      const surfR = cmux(["list-pane-surfaces", "--workspace", wid, "--pane", pref]);
+      if (surfR.exitCode === 0) {
+        for (const sline of surfR.stdout.split("\n").filter(Boolean)) {
+          const sref = parsePaneRef(sline); // same regex works for surface:N
+          if (sref) surfaces.push(sref);
+        }
+      }
     }
 
     const results: string[] = [];
     for (const sid of surfaces) {
       const r = cmux(["send", "--workspace", wid, "--surface", sid, cmd.join(" ")]);
+      cmux(["send-key", "--workspace", wid, "--surface", sid, "Enter"]);
       results.push(`${sid}: ${r.exitCode === 0 ? "ok" : r.stderr}`);
     }
     json({ ok: true, backend: "cmux", target, surfaces: surfaces.length, results });
