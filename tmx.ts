@@ -1,79 +1,82 @@
 #!/usr/bin/env bun
 
 /**
- * tmx — thin tmux orchestration CLI for Claude Code agent coordination
- * ~15 commands, zero dependencies, JSON output, ~10-30ms per operation.
+ * tmx — thin terminal orchestration CLI for Claude Code agent coordination
  *
- * Link: pm2 → tmux socket → no daemon, no MCP, no WebSocket overhead.
+ * Dual backend: auto-detects cmux (native CLI via Unix socket) or tmux.
+ * Zero dependencies, JSON output, ~10-30ms per operation.
  */
 
 // ── Help ────────────────────────────────────────────────────────────────────
 
 const HELP = `\
-tmx — thin tmux wrapper for Claude Code agent orchestration
+tmx — terminal orchestrator for Claude Code agent coordination
 
 USAGE
   tmx <command> [options]
 
 COMMANDS
-  new         -s <name> [-d] [cmd...]      Create session (detached with -d)
-  list        [session]                      List sessions/windows/panes as JSON
+  new         -s <name> [-d] [cmd...]      Create workspace
+  open        -t <target>                    Focus/switch to workspace
+  list        [target]                       List workspaces/panes as JSON
   has         -t <target>                    Check if target exists
-  kill        -t <target>                    Kill session/window/pane
-  split       -t <target> -h|-v             Split pane horizontally/vertically
-  resize      -t <target> -U|-D|-L|-R <n>  Resize pane by n cells
-  send        -t <target> <cmd...>           Send command to pane (+ Enter)
-  send-keys   -t <target> <keys...>          Send raw keystrokes (C-c, C-d, etc.)
-  capture     -t <target> [-S <n>] [-E <n>] [--raw]  Capture visible area
+  kill        -t <target>                    Close workspace/pane
+  split       -t <target> -h|-v             Split pane
+  resize      -t <target> -U|-D|-L|-R <n>  Resize pane
+  send        -t <target> <cmd...>           Send command (+ Enter)
+  send-keys   -t <target> <keys...>          Send raw keystrokes
+  capture     -t <target> [--raw]            Capture visible area
   capture-full -t <target> [--raw]           Capture full scrollback
   wait        -t <target> -p <pat> [-T <s>] [-i <ms>]  Poll until pattern
-  broadcast   -t <target> <cmd...>           Send to all panes in target
-  snapshot    -t <session>                   Export session layout as JSON
-  restore     <json-or-file>                 Restore from snapshot JSON
+  broadcast   -t <target> <cmd...>           Send to all panes
+  snapshot    -t <target>                    Export layout as JSON
 
 TARGET FORMAT
-  session                e.g. work
-  session:window         e.g. work:0
-  session:window.pane    e.g. work:0.1
+  name                    Workspace/session name
+  name:panel              Specific panel
+  name:panel.surface      Specific surface
 
 OUTPUT
   All commands emit JSON. Use --raw on capture|full for plain text.
-  Exit 0 on success, non-zero on failure.
+  Backend: cmux (when inside cmux) or tmux (fallback).
 `;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-interface SessionInfo {
+interface WorkspaceInfo {
   name: string;
-  windows: WindowInfo[];
-}
-
-interface WindowInfo {
-  index: number;
-  name: string;
-  active: boolean;
-  layout: string;
   panes: PaneInfo[];
 }
 
 interface PaneInfo {
-  index: number;
-  active: boolean;
+  id: string;
+  type: string;
   title: string;
+  active: boolean;
   cwd: string;
-  pid: string;
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
-function tmux(args: string[]): { stdout: string; stderr: string; exitCode: number } {
-  const proc = Bun.spawnSync(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
+const CMUX_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux";
+const isCmux = !!(process.env.CMUX_WORKSPACE_ID || process.env.CMUX_SURFACE_ID);
+
+function run(args: string[]): { stdout: string; stderr: string; exitCode: number } {
+  const proc = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe" });
   const dec = new TextDecoder();
   return {
     stdout: dec.decode(proc.stdout).trim(),
     stderr: dec.decode(proc.stderr).trim(),
     exitCode: proc.exitCode,
   };
+}
+
+function tmux(args: string[]): ReturnType<typeof run> {
+  return run(["tmux", ...args]);
+}
+
+function cmux(args: string[]): ReturnType<typeof run> {
+  return run([CMUX_BIN, ...args]);
 }
 
 function json<T>(data: T): void {
@@ -112,129 +115,254 @@ class Args {
   flag(name: string) { return this.flags.has(name); }
   opt(name: string) { return this.opts.get(name); }
   rest() { return this.positional; }
+  first() { return this.positional[0]; }
 }
 
-function parseTarget(raw: string): { session: string; window?: string; pane?: string } {
+// Split target like "name:panel.surface" or "name:panel" or "name"
+function parseTarget(raw: string) {
   const parts = raw.split(":");
-  const session = parts[0];
-  if (!session) throw new Error(`Invalid target: ${raw}`);
-  let window: string | undefined, pane: string | undefined;
+  const name = parts[0] || "";
+  let panel: string | undefined, surface: string | undefined;
   if (parts[1]) {
-    const wp = parts[1].split(".");
-    window = wp[0];
-    pane = wp[1];
+    const ps = parts[1].split(".");
+    panel = ps[0];
+    surface = ps[1];
   }
-  return { session, window, pane };
+  return { name, panel, surface };
 }
 
-// ── Commands ─────────────────────────────────────────────────────────────────
+// ── Cmux Helpers ─────────────────────────────────────────────────────────────
+
+// Parse cmux workspace ref from list-workspaces output line
+// Format: "* workspace:10  ✳ name  [selected]" or "  workspace:11  name"
+function parseWorkspaceRef(line: string): string | null {
+  const m = line.match(/(workspace:\d+)/);
+  return m ? m[1] : null;
+}
+
+function cmuxWorkspaceArg(target: string): string[] {
+  const { name } = parseTarget(target);
+
+  // If target is already a workspace:N ref, use directly
+  if (/^workspace:\d+$/.test(name)) return ["--workspace", name];
+
+  const r = cmux(["list-workspaces"]);
+  if (r.exitCode === 0) {
+    for (const line of r.stdout.split("\n")) {
+      if (line.includes(name)) {
+        const ref = parseWorkspaceRef(line);
+        if (ref) return ["--workspace", ref];
+      }
+    }
+  }
+  // Last resort: try the name directly
+  return ["--workspace", name];
+}
+
+function cmuxSurfaceArg(target: string): string[] {
+  const { surface } = parseTarget(target);
+  if (surface) return ["--surface", surface];
+  return [];
+}
+
+// ── Commands: new ────────────────────────────────────────────────────────────
 
 async function cmdNew(a: Args) {
-  const session = a.opt("-s");
-  if (!session) die("Missing -s <session-name>");
+  const name = a.opt("-s");
+  if (!name) die("Missing -s <name>");
 
-  const detached = a.flag("-d");
-  const cmd = a.rest();
-
-  const tArgs = ["new-session"];
-  if (detached) tArgs.push("-d");
-  tArgs.push("-s", session);
-  if (cmd.length > 0) tArgs.push(...cmd);
-
-  const r = tmux(tArgs);
-  if (r.exitCode !== 0) die(r.stderr || "Failed to create session");
-  json({ ok: true, session, detached });
+  if (isCmux) {
+    const r = cmux(["new-workspace", "--name", name]);
+    if (r.exitCode !== 0) die(r.stderr || "Failed to create workspace");
+    json({ ok: true, backend: "cmux", name });
+  } else {
+    const detached = a.flag("-d");
+    const cmd = a.rest();
+    const tArgs = ["new-session"];
+    if (detached) tArgs.push("-d");
+    tArgs.push("-s", name);
+    if (cmd.length > 0) tArgs.push(...cmd);
+    const r = tmux(tArgs);
+    if (r.exitCode !== 0) die(r.stderr || "Failed to create session");
+    json({ ok: true, backend: "tmux", name, detached });
+  }
 }
+
+// ── Commands: open ───────────────────────────────────────────────────────────
+
+async function cmdOpen(a: Args) {
+  const target = a.opt("-t") || a.first();
+  if (!target) die("Missing -t <target>");
+
+  if (isCmux) {
+    const r = cmux(["select-workspace", ...cmuxWorkspaceArg(target)]);
+    if (r.exitCode !== 0) die(r.stderr || `Workspace not found: ${target}`);
+    json({ ok: true, backend: "cmux", target });
+  } else {
+    const has = tmux(["has-session", "-t", target]);
+    if (has.exitCode !== 0) die(`Session not found: ${target}`);
+    const script = `tell application "Terminal" to do script "tmux attach -t ${target}"`;
+    const r = run(["osascript", "-e", script]);
+    if (r.exitCode !== 0) {
+      json({ ok: false, backend: "tmux", target, hint: `Run: tmux attach -t ${target}` });
+      return;
+    }
+    json({ ok: true, backend: "tmux", target, opened: "Terminal.app" });
+  }
+}
+
+// ── Commands: list ───────────────────────────────────────────────────────────
 
 async function cmdList(a: Args) {
-  const rest = a.rest();
-  const filter = rest[0];
+  const filter = a.first();
 
-  const sessionsR = tmux(["list-sessions", "-F", "#{session_name}"]);
-  if (sessionsR.exitCode !== 0) { json({ sessions: [] }); return; }
+  if (isCmux) {
+    const wsR = cmux(["list-workspaces"]);
+    if (wsR.exitCode !== 0) { json({ workspaces: [] }); return; }
 
-  const sessions: SessionInfo[] = [];
-  for (const sname of sessionsR.stdout.split("\n").filter(Boolean)) {
-    if (filter && sname !== filter) continue;
+    const workspaces: WorkspaceInfo[] = [];
+    for (const wline of wsR.stdout.split("\n").filter(Boolean)) {
+      // Parse: "* workspace:10  name  [selected]" or "  workspace:11  name"
+      const ref = parseWorkspaceRef(wline);
+      if (!ref) continue;
 
-    const winsR = tmux(["list-windows", "-t", sname, "-F", "#{window_index}\t#{window_name}\t#{window_active}\t#{window_layout}"]);
-    if (winsR.exitCode !== 0) continue;
+      // Remove leading marker and [selected] suffix, then extract name
+      let nameLine = wline.replace(/^\*\s*/, "").replace(/\s*\[selected\]\s*$/, "").trim();
+      // Remove the workspace:N prefix
+      nameLine = nameLine.replace(/^workspace:\d+\s+/, "").trim();
+      const wname = nameLine || ref;
 
-    const windows: WindowInfo[] = [];
-    for (const wline of winsR.stdout.split("\n").filter(Boolean)) {
-      const [wi, wn, wa, wl] = wline.split("\t");
+      if (filter && wname !== filter && ref !== filter) continue;
 
-      const panesR = tmux(["list-panes", "-t", `${sname}:${wi}`, "-F", "#{pane_index}\t#{pane_active}\t#{pane_title}\t#{pane_current_path}\t#{pane_pid}"]);
       const panes: PaneInfo[] = [];
-      if (panesR.exitCode === 0) {
-        for (const pline of panesR.stdout.split("\n").filter(Boolean)) {
-          const [pi, pa, pt, pc, pp] = pline.split("\t");
-          panes.push({ index: +pi!, active: pa === "1", title: pt || "", cwd: pc || "", pid: pp || "" });
+      const pR = cmux(["list-panes", "--workspace", ref]);
+      if (pR.exitCode === 0) {
+        for (const pline of pR.stdout.split("\n").filter(Boolean)) {
+          const pParts = pline.split("\t");
+          panes.push({
+            id: pParts[0] || pline,
+            type: pParts[1] || "terminal",
+            title: pParts[2] || "",
+            active: pParts[3] === "active" || pParts[3] === "true",
+            cwd: pParts[4] || "",
+          });
         }
       }
-      windows.push({ index: +wi!, name: wn || "", active: wa === "1", layout: wl || "", panes });
+      workspaces.push({ name: wname, panes });
     }
-    sessions.push({ name: sname, windows });
+    json({ workspaces });
+  } else {
+    const sessionsR = tmux(["list-sessions", "-F", "#{session_name}"]);
+    if (sessionsR.exitCode !== 0) { json({ sessions: [] }); return; }
+
+    const sessions: any[] = [];
+    for (const sname of sessionsR.stdout.split("\n").filter(Boolean)) {
+      if (filter && sname !== filter) continue;
+
+      const winsR = tmux(["list-windows", "-t", sname, "-F", "#{window_index}\t#{window_name}\t#{window_active}\t#{window_layout}"]);
+      if (winsR.exitCode !== 0) continue;
+
+      const windows: any[] = [];
+      for (const wline of winsR.stdout.split("\n").filter(Boolean)) {
+        const [wi, wn, wa, wl] = wline.split("\t");
+        const panesR = tmux(["list-panes", "-t", `${sname}:${wi}`, "-F", "#{pane_index}\t#{pane_active}\t#{pane_title}\t#{pane_current_path}\t#{pane_pid}"]);
+        const panes: any[] = [];
+        if (panesR.exitCode === 0) {
+          for (const pline of panesR.stdout.split("\n").filter(Boolean)) {
+            const [pi, pa, pt, pc, pp] = pline.split("\t");
+            panes.push({ index: +pi!, active: pa === "1", title: pt, cwd: pc, pid: pp });
+          }
+        }
+        windows.push({ index: +wi!, name: wn, active: wa === "1", layout: wl, panes });
+      }
+      sessions.push({ name: sname, windows });
+    }
+    json({ sessions });
   }
-  json({ sessions });
 }
+
+// ── Commands: has ────────────────────────────────────────────────────────────
 
 async function cmdHas(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
 
-  const { session, window } = parseTarget(target);
-
-  const r = tmux(["has-session", "-t", session]);
-  if (r.exitCode !== 0) { json({ exists: false, target }); return; }
-
-  if (window) {
-    const wr = tmux(["list-windows", "-t", session, "-F", "#{window_index}"]);
-    if (!wr.stdout.split("\n").includes(window)) { json({ exists: false, target }); return; }
+  if (isCmux) {
+    const r = cmux(["list-workspaces"]);
+    const exists = r.exitCode === 0 && r.stdout.includes(target);
+    json({ exists, target, backend: "cmux" });
+  } else {
+    const r = tmux(["has-session", "-t", target]);
+    json({ exists: r.exitCode === 0, target, backend: "tmux" });
   }
-  json({ exists: true, target });
 }
+
+// ── Commands: kill ───────────────────────────────────────────────────────────
 
 async function cmdKill(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
 
-  let r = tmux(["kill-session", "-t", target]);
-  if (r.exitCode === 0) { json({ ok: true, killed: target }); return; }
-  r = tmux(["kill-window", "-t", target]);
-  if (r.exitCode === 0) { json({ ok: true, killed: target }); return; }
-  r = tmux(["kill-pane", "-t", target]);
-  if (r.exitCode === 0) { json({ ok: true, killed: target }); return; }
-  die(`Failed to kill target: ${target}`);
+  if (isCmux) {
+    const r = cmux(["close-workspace", ...cmuxWorkspaceArg(target)]);
+    if (r.exitCode !== 0) die(r.stderr || `Failed to close: ${target}`);
+    json({ ok: true, backend: "cmux", killed: target });
+  } else {
+    let r = tmux(["kill-session", "-t", target]);
+    if (r.exitCode === 0) { json({ ok: true, backend: "tmux", killed: target }); return; }
+    r = tmux(["kill-window", "-t", target]);
+    if (r.exitCode === 0) { json({ ok: true, backend: "tmux", killed: target }); return; }
+    r = tmux(["kill-pane", "-t", target]);
+    if (r.exitCode === 0) { json({ ok: true, backend: "tmux", killed: target }); return; }
+    die(`Failed to kill target: ${target}`);
+  }
 }
+
+// ── Commands: split ──────────────────────────────────────────────────────────
 
 async function cmdSplit(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
 
-  const direction = a.flag("-h") ? "-h" : a.flag("-v") ? "-v" : "";
-  if (!direction) die("Missing -h or -v");
+  const dirFlag = a.flag("-h") ? "right" : a.flag("-v") ? "down" : "";
+  if (!dirFlag) die("Missing -h or -v");
 
-  const r = tmux(["split-window", direction, "-t", target]);
-  if (r.exitCode !== 0) die(r.stderr || "Split failed");
-  json({ ok: true, target, direction });
+  if (isCmux) {
+    const r = cmux(["new-split", dirFlag, ...cmuxWorkspaceArg(target)]);
+    if (r.exitCode !== 0) die(r.stderr || "Split failed");
+    json({ ok: true, backend: "cmux", target, direction: dirFlag });
+  } else {
+    const d = a.flag("-h") ? "-h" : "-v";
+    const r = tmux(["split-window", d, "-t", target]);
+    if (r.exitCode !== 0) die(r.stderr || "Split failed");
+    json({ ok: true, backend: "tmux", target, direction: d });
+  }
 }
+
+// ── Commands: resize ─────────────────────────────────────────────────────────
 
 async function cmdResize(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
 
-  const dirFlag = ["-U", "-D", "-L", "-R"].find(f => a.flag(f));
+  const dirFlag = (["-U", "-D", "-L", "-R"] as const).find(f => a.flag(f));
   if (!dirFlag) die("Missing direction: -U, -D, -L, or -R");
 
-  const rest = a.rest();
-  const size = rest[0];
-  if (!size || !/^\d+$/.test(size)) die("Missing or invalid size (number of cells)");
+  const size = a.rest()[0];
+  if (!size || !/^\d+$/.test(size)) die("Missing or invalid size");
 
-  const r = tmux(["resize-pane", "-t", target, dirFlag, size]);
-  if (r.exitCode !== 0) die(r.stderr || "Resize failed");
-  json({ ok: true, target, direction: dirFlag, size: +size });
+  if (isCmux) {
+    const r = cmux(["resize-pane", ...cmuxWorkspaceArg(target), dirFlag, "--amount", size]);
+    if (r.exitCode !== 0) die(r.stderr || "Resize failed");
+    json({ ok: true, backend: "cmux", target, direction: dirFlag, size: +size });
+  } else {
+    const r = tmux(["resize-pane", "-t", target, dirFlag, size]);
+    if (r.exitCode !== 0) die(r.stderr || "Resize failed");
+    json({ ok: true, backend: "tmux", target, direction: dirFlag, size: +size });
+  }
 }
+
+// ── Commands: send ───────────────────────────────────────────────────────────
 
 async function cmdSend(a: Args) {
   const target = a.opt("-t");
@@ -243,10 +371,19 @@ async function cmdSend(a: Args) {
   const cmd = a.rest();
   if (cmd.length === 0) die("Missing command to send");
 
-  const r = tmux(["send-keys", "-t", target, ...cmd, "Enter"]);
-  if (r.exitCode !== 0) die(r.stderr || "Send failed");
-  json({ ok: true, target, sent: cmd.join(" ") });
+  if (isCmux) {
+    const args = ["send", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), cmd.join(" ")];
+    const r = cmux(args);
+    if (r.exitCode !== 0) die(r.stderr || "Send failed");
+    json({ ok: true, backend: "cmux", target, sent: cmd.join(" ") });
+  } else {
+    const r = tmux(["send-keys", "-t", target, ...cmd, "Enter"]);
+    if (r.exitCode !== 0) die(r.stderr || "Send failed");
+    json({ ok: true, backend: "tmux", target, sent: cmd.join(" ") });
+  }
 }
+
+// ── Commands: send-keys ──────────────────────────────────────────────────────
 
 async function cmdSendKeys(a: Args) {
   const target = a.opt("-t");
@@ -255,57 +392,80 @@ async function cmdSendKeys(a: Args) {
   const keys = a.rest();
   if (keys.length === 0) die("Missing keys");
 
-  const r = tmux(["send-keys", "-t", target, ...keys]);
-  if (r.exitCode !== 0) die(r.stderr || "Send-keys failed");
-  json({ ok: true, target, keys: keys.join(" ") });
+  if (isCmux) {
+    const r = cmux(["send-key", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), keys.join(" ")]);
+    if (r.exitCode !== 0) die(r.stderr || "Send-key failed");
+    json({ ok: true, backend: "cmux", target, keys: keys.join(" ") });
+  } else {
+    const r = tmux(["send-keys", "-t", target, ...keys]);
+    if (r.exitCode !== 0) die(r.stderr || "Send-keys failed");
+    json({ ok: true, backend: "tmux", target, keys: keys.join(" ") });
+  }
 }
+
+// ── Commands: capture ────────────────────────────────────────────────────────
 
 async function cmdCapture(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
-
-  const start = a.opt("-S");
-  const end = a.opt("-E");
   const raw = a.flag("--raw");
 
-  const tArgs = ["capture-pane", "-p", "-t", target];
-  if (start) tArgs.push("-S", start);
-  if (end) tArgs.push("-E", end);
-
-  const r = tmux(tArgs);
-  if (r.exitCode !== 0) die(r.stderr || "Capture failed");
-
-  if (raw) { console.log(r.stdout); } else { json({ ok: true, target, content: r.stdout }); }
+  if (isCmux) {
+    const r = cmux(["read-screen", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target)]);
+    if (r.exitCode !== 0) die(r.stderr || "Capture failed");
+    if (raw) { console.log(r.stdout); } else { json({ ok: true, backend: "cmux", target, content: r.stdout }); }
+  } else {
+    const start = a.opt("-S"), end = a.opt("-E");
+    const tArgs = ["capture-pane", "-p", "-t", target];
+    if (start) tArgs.push("-S", start);
+    if (end) tArgs.push("-E", end);
+    const r = tmux(tArgs);
+    if (r.exitCode !== 0) die(r.stderr || "Capture failed");
+    if (raw) { console.log(r.stdout); } else { json({ ok: true, backend: "tmux", target, content: r.stdout }); }
+  }
 }
+
+// ── Commands: capture-full ───────────────────────────────────────────────────
 
 async function cmdCaptureFull(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
-
   const raw = a.flag("--raw");
 
-  const r = tmux(["capture-pane", "-p", "-t", target, "-S", "-", "-E", "-"]);
-  if (r.exitCode !== 0) die(r.stderr || "Capture-full failed");
-
-  if (raw) { console.log(r.stdout); } else { json({ ok: true, target, content: r.stdout }); }
+  if (isCmux) {
+    const r = cmux(["read-screen", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), "--scrollback"]);
+    if (r.exitCode !== 0) die(r.stderr || "Capture-full failed");
+    if (raw) { console.log(r.stdout); } else { json({ ok: true, backend: "cmux", target, content: r.stdout }); }
+  } else {
+    const r = tmux(["capture-pane", "-p", "-t", target, "-S", "-", "-E", "-"]);
+    if (r.exitCode !== 0) die(r.stderr || "Capture-full failed");
+    if (raw) { console.log(r.stdout); } else { json({ ok: true, backend: "tmux", target, content: r.stdout }); }
+  }
 }
+
+// ── Commands: wait ───────────────────────────────────────────────────────────
 
 async function cmdWait(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
-
   const pattern = a.opt("-p");
   if (!pattern) die("Missing -p <pattern>");
 
   const timeout = +(a.opt("-T") || "30");
   const interval = +(a.opt("-i") || "500");
-
   const deadline = Date.now() + timeout * 1000;
   const startTime = Date.now();
 
   while (Date.now() < deadline) {
-    const r = tmux(["capture-pane", "-p", "-t", target, "-S", "-", "-E", "-"]);
-    if (r.exitCode === 0 && r.stdout.includes(pattern)) {
+    let content: string;
+    if (isCmux) {
+      const r = cmux(["read-screen", ...cmuxWorkspaceArg(target), ...cmuxSurfaceArg(target), "--scrollback"]);
+      content = r.stdout;
+    } else {
+      const r = tmux(["capture-pane", "-p", "-t", target, "-S", "-", "-E", "-"]);
+      content = r.stdout;
+    }
+    if (content.includes(pattern)) {
       json({ ok: true, target, pattern, elapsed_ms: Date.now() - startTime });
       return;
     }
@@ -316,96 +476,75 @@ async function cmdWait(a: Args) {
   process.exit(1);
 }
 
+// ── Commands: broadcast ──────────────────────────────────────────────────────
+
 async function cmdBroadcast(a: Args) {
   const target = a.opt("-t");
   if (!target) die("Missing -t <target>");
-
   const cmd = a.rest();
   if (cmd.length === 0) die("Missing command");
 
-  const panesR = tmux(["list-panes", "-t", target, "-F", "#{session_name}:#{window_index}.#{pane_index}"]);
-  if (panesR.exitCode !== 0) die("No panes found for: " + target);
+  if (isCmux) {
+    // Get all surfaces in workspace
+    const wsArg = cmuxWorkspaceArg(target);
+    const wid = wsArg[1] || target;
+    const panesR = cmux(["list-panes", "--workspace", wid]);
+    if (panesR.exitCode !== 0) die("No panes found for: " + target);
 
-  const panes = panesR.stdout.split("\n").filter(Boolean);
-  const results: string[] = [];
+    const surfaces: string[] = [];
+    for (const line of panesR.stdout.split("\n").filter(Boolean)) {
+      const parts = line.split("\t");
+      if (parts[0]) surfaces.push(parts[0]);
+    }
 
-  for (const pane of panes) {
-    const r = tmux(["send-keys", "-t", pane, ...cmd, "Enter"]);
-    results.push(`${pane}: ${r.exitCode === 0 ? "ok" : r.stderr}`);
+    const results: string[] = [];
+    for (const sid of surfaces) {
+      const r = cmux(["send", "--workspace", wid, "--surface", sid, cmd.join(" ")]);
+      results.push(`${sid}: ${r.exitCode === 0 ? "ok" : r.stderr}`);
+    }
+    json({ ok: true, backend: "cmux", target, surfaces: surfaces.length, results });
+  } else {
+    const panesR = tmux(["list-panes", "-t", target, "-F", "#{session_name}:#{window_index}.#{pane_index}"]);
+    if (panesR.exitCode !== 0) die("No panes found for: " + target);
+
+    const panes = panesR.stdout.split("\n").filter(Boolean);
+    const results: string[] = [];
+    for (const pane of panes) {
+      const r = tmux(["send-keys", "-t", pane, ...cmd, "Enter"]);
+      results.push(`${pane}: ${r.exitCode === 0 ? "ok" : r.stderr}`);
+    }
+    json({ ok: true, backend: "tmux", target, panes: panes.length, results });
   }
-
-  json({ ok: true, target, panes: panes.length, results });
 }
+
+// ── Commands: snapshot ───────────────────────────────────────────────────────
 
 async function cmdSnapshot(a: Args) {
   const target = a.opt("-t");
-  if (!target) die("Missing -t <session>");
+  if (!target) die("Missing -t <target>");
 
-  const winsR = tmux(["list-windows", "-t", target, "-F", "#{window_index}\t#{window_name}\t#{window_layout}"]);
-  if (winsR.exitCode !== 0) die("Session not found: " + target);
+  if (isCmux) {
+    const r = cmux(["tree", "--workspace", target]);
+    json({ backend: "cmux", target, tree: r.stdout || "(empty)" });
+  } else {
+    const winsR = tmux(["list-windows", "-t", target, "-F", "#{window_index}\t#{window_name}\t#{window_layout}"]);
+    if (winsR.exitCode !== 0) die("Session not found: " + target);
 
-  const windows: any[] = [];
-  for (const wline of winsR.stdout.split("\n").filter(Boolean)) {
-    const [wi, wn, wl] = wline.split("\t");
-
-    const panesR = tmux(["list-panes", "-t", `${target}:${wi}`, "-F", "#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"]);
-    const panes: any[] = [];
-    if (panesR.exitCode === 0) {
-      for (const pline of panesR.stdout.split("\n").filter(Boolean)) {
-        const [pi, pc, pcmd] = pline.split("\t");
-        panes.push({ index: +pi!, cwd: pc, command: pcmd });
+    const windows: any[] = [];
+    for (const wline of winsR.stdout.split("\n").filter(Boolean)) {
+      const [wi, wn, wl] = wline.split("\t");
+      const panesR = tmux(["list-panes", "-t", `${target}:${wi}`, "-F", "#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"]);
+      const panes: any[] = [];
+      if (panesR.exitCode === 0) {
+        for (const pline of panesR.stdout.split("\n").filter(Boolean)) {
+          const [pi, pc, pcmd] = pline.split("\t");
+          panes.push({ index: +pi!, cwd: pc, command: pcmd });
+        }
       }
+      windows.push({ index: +wi!, name: wn, layout: wl, panes });
     }
-    windows.push({ index: +wi!, name: wn, layout: wl, panes });
+    json({ backend: "tmux", target, windows });
   }
-
-  json({ session: target, windows });
-}
-
-async function cmdRestore(a: Args) {
-  const rest = a.rest();
-  if (rest.length === 0) die("Missing snapshot JSON or file path");
-
-  const input = rest.join(" ");
-  let snapshot: any;
-
-  try {
-    snapshot = JSON.parse(input);
-  } catch {
-    try {
-      snapshot = JSON.parse(await Bun.file(input).text());
-    } catch {
-      die("Invalid snapshot: not valid JSON and not a readable file");
-    }
-  }
-
-  if (!snapshot.session || !Array.isArray(snapshot.windows)) {
-    die("Invalid snapshot format: need { session, windows }");
-  }
-
-  let r = tmux(["new-session", "-d", "-s", snapshot.session]);
-  if (r.exitCode !== 0) die("Failed to create session: " + r.stderr);
-
-  for (let wi = 0; wi < snapshot.windows.length; wi++) {
-    const win = snapshot.windows[wi];
-
-    if (wi > 0) {
-      r = tmux(["new-window", "-t", snapshot.session, "-n", win.name || `win${wi}`]);
-      if (r.exitCode !== 0) continue;
-    }
-
-    const paneCount = win.panes?.length || 1;
-    for (let pi = 1; pi < paneCount; pi++) {
-      const pane = win.panes[pi];
-      tmux(["split-window", "-t", `${snapshot.session}:${win.index}`, "-c", pane?.cwd || process.env.HOME || "/"]);
-    }
-
-    if (win.layout) {
-      tmux(["select-layout", "-t", `${snapshot.session}:${win.index}`, win.layout]);
-    }
-  }
-
-  json({ ok: true, restored: snapshot.session, windows: snapshot.windows.length });
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -418,14 +557,21 @@ async function main() {
     process.exit(0);
   }
 
-  const check = tmux(["-V"]);
-  if (check.exitCode !== 0) die("tmux not found. Install: brew install tmux");
+  // Verify at least one backend is available
+  if (isCmux) {
+    const check = cmux(["ping"]);
+    if (check.exitCode !== 0) die("cmux daemon not reachable. Is cmux running?");
+  } else {
+    const check = tmux(["-V"]);
+    if (check.exitCode !== 0) die("tmux not found. Install: brew install tmux");
+  }
 
   const cmd = args[0]!;
   const a = new Args(args.slice(1));
 
   switch (cmd) {
     case "new":           return cmdNew(a);
+    case "open":          return cmdOpen(a);
     case "list":          return cmdList(a);
     case "has":           return cmdHas(a);
     case "kill":          return cmdKill(a);
@@ -438,7 +584,6 @@ async function main() {
     case "wait":          return cmdWait(a);
     case "broadcast":     return cmdBroadcast(a);
     case "snapshot":      return cmdSnapshot(a);
-    case "restore":       return cmdRestore(a);
     default:
       die(`Unknown command: ${cmd}\nRun 'tmx --help' for usage.`);
   }
